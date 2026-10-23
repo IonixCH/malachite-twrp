@@ -21,13 +21,45 @@ jobs:
         with:
           path: device_tree
 
-      - name: Bebaskan disk runner
+      - name: Siapkan ruang kerja besar (bersihkan + gabung disk)
         run: |
-          df -h /
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          set -x
+          echo "CPU: $(nproc --all) | RAM: $(free -g | awk '/Mem:/ {print $2}') GB"
+          df -h / /mnt
+          # 1) Buang paket bawaan runner yang besar
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache \
+            /usr/local/share/boost /usr/share/swift /usr/local/.ghcup /opt/microsoft /opt/google \
+            /usr/local/share/powershell /usr/lib/google-cloud-sdk /usr/lib/jvm /usr/share/miniconda \
+            /usr/local/julia* /usr/lib/firefox /opt/az || true
           sudo docker image prune --all --force || true
           sudo apt-get clean
-          df -h /
+          df -h / /mnt
+          # 2) Swap kalau RAM kecil (runner private biasanya 7 GB)
+          MEM_MB=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
+          if [ "$MEM_MB" -lt 12000 ]; then
+            sudo fallocate -l 8G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile || true
+          fi
+          # 3) Gabung sisa disk root + /mnt jadi satu volume besar di ~/twrp (LVM di atas loop file)
+          if sudo apt-get install -y lvm2; then
+            ROOT_FREE=$(df -BM --output=avail / | tail -1 | tr -dc '0-9')
+            MNT_FREE=$(df -BM --output=avail /mnt | tail -1 | tr -dc '0-9')
+            ROOT_ALLOC=$((ROOT_FREE - 4096)); MNT_ALLOC=$((MNT_FREE - 1024))
+            if [ "$ROOT_ALLOC" -gt 4096 ] && [ "$MNT_ALLOC" -gt 4096 ]; then
+              sudo fallocate -l "${ROOT_ALLOC}M" /root-build.img
+              sudo fallocate -l "${MNT_ALLOC}M" /mnt/build.img
+              RL=$(sudo losetup --find --show /root-build.img)
+              ML=$(sudo losetup --find --show /mnt/build.img)
+              sudo pvcreate "$RL" "$ML"
+              sudo vgcreate buildvg "$RL" "$ML"
+              sudo lvcreate -n buildlv -l 100%FREE buildvg
+              sudo mkfs.ext4 -m 0 -O ^has_journal /dev/buildvg/buildlv
+              sudo mkdir -p /home/runner/twrp
+              sudo mount /dev/buildvg/buildlv /home/runner/twrp
+              sudo chown -R "$(id -u):$(id -g)" /home/runner/twrp
+            fi
+          fi
+          mkdir -p /home/runner/twrp
+          df -h /home/runner/twrp
 
       - name: Install dependensi
         run: |
@@ -126,3 +158,9 @@ jobs:
           name: build-log
           path: ~/build.log
           retention-days: 7
+
+      - name: Diagnostik disk (kalau gagal)
+        if: failure()
+        run: |
+          df -h || true
+          du -sh ~/twrp/.repo ~/twrp 2>/dev/null || true
