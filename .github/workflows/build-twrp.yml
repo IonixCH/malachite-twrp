@@ -21,45 +21,36 @@ jobs:
         with:
           path: device_tree
 
-      - name: Siapkan ruang kerja besar (bersihkan + gabung disk)
+      - name: Siapkan ruang kerja (bersihkan + pilih disk terbesar + cek cukup)
         run: |
-          set -x
           echo "CPU: $(nproc --all) | RAM: $(free -g | awk '/Mem:/ {print $2}') GB"
-          df -h / /mnt
-          # 1) Buang paket bawaan runner yang besar
+          echo "--- disk SEBELUM bersih-bersih"; df -h / /mnt
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache \
             /usr/local/share/boost /usr/share/swift /usr/local/.ghcup /opt/microsoft /opt/google \
             /usr/local/share/powershell /usr/lib/google-cloud-sdk /usr/lib/jvm /usr/share/miniconda \
             /usr/local/julia* /usr/lib/firefox /opt/az || true
           sudo docker image prune --all --force || true
           sudo apt-get clean
-          df -h / /mnt
-          # 2) Swap kalau RAM kecil (runner private biasanya 7 GB)
-          MEM_MB=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo)
-          if [ "$MEM_MB" -lt 12000 ]; then
-            sudo fallocate -l 8G /swapfile && sudo chmod 600 /swapfile && sudo mkswap /swapfile && sudo swapon /swapfile || true
+          echo "--- disk SESUDAH bersih-bersih"; df -h / /mnt
+          ROOT_MB=$(df -BM --output=avail / | tail -1 | tr -dc '0-9')
+          MNT_MB=$(df -BM --output=avail /mnt 2>/dev/null | tail -1 | tr -dc '0-9')
+          MNT_MB=${MNT_MB:-0}
+          echo "Sisa: / = ${ROOT_MB} MB, /mnt = ${MNT_MB} MB"
+          if [ "$MNT_MB" -gt "$ROOT_MB" ]; then
+            WORKDIR=/mnt/twrp; AVAIL=$MNT_MB
+            sudo mkdir -p /mnt/twrp && sudo chown -R "$(id -u):$(id -g)" /mnt/twrp
+            ln -sfn /mnt/twrp /home/runner/twrp
+          else
+            WORKDIR=/home/runner/twrp; AVAIL=$ROOT_MB
+            mkdir -p /home/runner/twrp
           fi
-          # 3) Gabung sisa disk root + /mnt jadi satu volume besar di ~/twrp (LVM di atas loop file)
-          if sudo apt-get install -y lvm2; then
-            ROOT_FREE=$(df -BM --output=avail / | tail -1 | tr -dc '0-9')
-            MNT_FREE=$(df -BM --output=avail /mnt | tail -1 | tr -dc '0-9')
-            ROOT_ALLOC=$((ROOT_FREE - 4096)); MNT_ALLOC=$((MNT_FREE - 1024))
-            if [ "$ROOT_ALLOC" -gt 4096 ] && [ "$MNT_ALLOC" -gt 4096 ]; then
-              sudo fallocate -l "${ROOT_ALLOC}M" /root-build.img
-              sudo fallocate -l "${MNT_ALLOC}M" /mnt/build.img
-              RL=$(sudo losetup --find --show /root-build.img)
-              ML=$(sudo losetup --find --show /mnt/build.img)
-              sudo pvcreate "$RL" "$ML"
-              sudo vgcreate buildvg "$RL" "$ML"
-              sudo lvcreate -n buildlv -l 100%FREE buildvg
-              sudo mkfs.ext4 -m 0 -O ^has_journal /dev/buildvg/buildlv
-              sudo mkdir -p /home/runner/twrp
-              sudo mount /dev/buildvg/buildlv /home/runner/twrp
-              sudo chown -R "$(id -u):$(id -g)" /home/runner/twrp
-            fi
+          echo "WORKDIR=$WORKDIR" >> "$GITHUB_ENV"
+          echo "Ruang kerja: $WORKDIR dengan ${AVAIL} MB bebas"
+          NEED=38000
+          if [ "$AVAIL" -lt "$NEED" ]; then
+            echo "::error::Disk runner cuma ${AVAIL} MB bebas, butuh sekitar ${NEED} MB. GitHub Actions gratis tidak cukup untuk build ini."
+            exit 1
           fi
-          mkdir -p /home/runner/twrp
-          df -h /home/runner/twrp
 
       - name: Install dependensi
         run: |
@@ -75,12 +66,29 @@ jobs:
           git config --global user.email "builder@example.com"
           git config --global color.ui false
 
-      - name: Sync manifest TWRP minimal (twrp-14.1)
+      - name: Sync manifest TWRP minimal (twrp-14.1) dengan penjaga disk
         run: |
           mkdir -p ~/twrp && cd ~/twrp
+          # Penjaga: hentikan sync sebelum disk benar-benar penuh (supaya runner tidak crash dan log tetap ada)
+          (
+            while true; do
+              A=$(df -BM --output=avail "$WORKDIR" | tail -1 | tr -dc '0-9')
+              if [ "${A:-0}" -lt 1500 ]; then
+                echo "::error::DISK KRITIS (${A} MB tersisa), sync dihentikan"
+                pkill -f "repo" || true
+                break
+              fi
+              sleep 5
+            done
+          ) &
+          GUARD=$!
           repo init --depth=1 -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git -b twrp-14.1
+          set +e
           repo sync -c -j"$(nproc --all)" --force-sync --no-clone-bundle --no-tags
-          df -h /
+          RC=$?
+          kill "$GUARD" 2>/dev/null || true
+          echo "--- hasil sync: rc=$RC"; df -h "$WORKDIR"; du -sh .repo . 2>/dev/null || true
+          exit "$RC"
 
       - name: Pasang device tree + override
         run: |
