@@ -2,9 +2,10 @@
 name: Build TWRP (malachite)
 
 env:
-  REPO_SYNC_JOBS: 2
-  BUILD_JOBS: 2
+  REPO_SYNC_JOBS: 1
+  BUILD_JOBS: 1
   MIN_FREE_MB: 16000
+  BUILD_DISK_CRIT_MB: 4000
 
 on:
   workflow_dispatch:
@@ -113,8 +114,25 @@ jobs:
           mkdir -p "$CCACHE_DIR"
           ccache -M 8G >/dev/null || true
           if [ "$PERM" = "true" ]; then export MALACHITE_RECOVERY_PERMISSIVE=true; fi
+
+          (
+            while true; do
+              A=$(df -BM --output=avail "$WORKDIR" | tail -1 | tr -dc '0-9')
+              if [ "${A:-0}" -lt "$BUILD_DISK_CRIT_MB" ]; then
+                echo "::error::DISK KRITIS (${A} MB tersisa), build dihentikan sebelum runner dibunuh"
+                pkill -f "mka|soong|java" || true
+                exit 1
+              fi
+              sleep 15
+            done
+          ) &
+
+          GUARD=$!
           set +e
           source build/envsetup.sh
           lunch twrp_malachite-ap2a-eng
           mka vendorbootimage -j"${BUILD_JOBS}" 2>&1 | tee ~/build.log
-          exit "${PIPESTATUS[0]}"
+          RC=${PIPESTATUS[0]}
+          kill "$GUARD" 2>/dev/null || true
+          echo "--- hasil build: rc=$RC"; df -h "$WORKDIR"
+          exit "$RC"
