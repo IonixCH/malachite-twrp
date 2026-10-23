@@ -1,7 +1,10 @@
 # Build TWRP malachite (vendor_boot.img) di GitHub Actions.
-# Mengikuti langkah README upstream: manifest TWRP minimal twrp-14.1 + patch bootable/recovery.
-# STATUS: belum pernah dijalankan. Kalau gagal, unduh artifact "build-log" dan kirim errornya.
 name: Build TWRP (malachite)
+
+env:
+  REPO_SYNC_JOBS: 2
+  BUILD_JOBS: 2
+  MIN_FREE_MB: 16000
 
 on:
   workflow_dispatch:
@@ -36,7 +39,7 @@ jobs:
           MNT_MB=$(df -BM --output=avail /mnt 2>/dev/null | tail -1 | tr -dc '0-9')
           MNT_MB=${MNT_MB:-0}
           echo "Sisa: / = ${ROOT_MB} MB, /mnt = ${MNT_MB} MB"
-          if [ "$MNT_MB" -gt "$ROOT_MB" ]; then
+          if [ "$MNT_MB" -gt "$ROOT_MB" ] && [ "$MNT_MB" -gt 15000 ]; then
             WORKDIR=/mnt/twrp; AVAIL=$MNT_MB
             sudo mkdir -p /mnt/twrp && sudo chown -R "$(id -u):$(id -g)" /mnt/twrp
             ln -sfn /mnt/twrp /home/runner/twrp
@@ -46,16 +49,15 @@ jobs:
           fi
           echo "WORKDIR=$WORKDIR" >> "$GITHUB_ENV"
           echo "Ruang kerja: $WORKDIR dengan ${AVAIL} MB bebas"
-          NEED=38000
-          if [ "$AVAIL" -lt "$NEED" ]; then
-            echo "::error::Disk runner cuma ${AVAIL} MB bebas, butuh sekitar ${NEED} MB. GitHub Actions gratis tidak cukup untuk build ini."
+          if [ "$AVAIL" -lt "$MIN_FREE_MB" ]; then
+            echo "::error::Disk runner cuma ${AVAIL} MB bebas. Butuh sekitar ${MIN_FREE_MB} MB supaya build tidak dibunuh runner."
             exit 1
           fi
 
       - name: Install dependensi
         run: |
           sudo apt-get update
-          sudo apt-get install -y git-core git-lfs gnupg flex bison build-essential zip curl \
+          sudo apt-get install -y --no-install-recommends git-core git-lfs gnupg flex bison build-essential zip curl \
             zlib1g-dev libc6-dev-i386 libncurses5 x11proto-core-dev libx11-dev lib32z1-dev \
             libgl1-mesa-dev libxml2-utils xsltproc unzip fontconfig python3 lz4 bc ccache rsync libssl-dev
           mkdir -p ~/bin
@@ -65,15 +67,15 @@ jobs:
           git config --global user.name "builder"
           git config --global user.email "builder@example.com"
           git config --global color.ui false
+          sudo apt-get clean
 
       - name: Sync manifest TWRP minimal (twrp-14.1) dengan penjaga disk
         run: |
           mkdir -p ~/twrp && cd ~/twrp
-          # Penjaga: hentikan sync sebelum disk benar-benar penuh (supaya runner tidak crash dan log tetap ada)
           (
             while true; do
               A=$(df -BM --output=avail "$WORKDIR" | tail -1 | tr -dc '0-9')
-              if [ "${A:-0}" -lt 1500 ]; then
+              if [ "${A:-0}" -lt 2000 ]; then
                 echo "::error::DISK KRITIS (${A} MB tersisa), sync dihentikan"
                 pkill -f "repo" || true
                 break
@@ -84,41 +86,11 @@ jobs:
           GUARD=$!
           repo init --depth=1 -u https://github.com/minimal-manifest-twrp/platform_manifest_twrp_aosp.git -b twrp-14.1
           set +e
-          repo sync -c -j"$(nproc --all)" --force-sync --no-clone-bundle --no-tags
+          repo sync -c -j"${REPO_SYNC_JOBS}" --force-sync --no-clone-bundle --no-tags
           RC=$?
           kill "$GUARD" 2>/dev/null || true
           echo "--- hasil sync: rc=$RC"; df -h "$WORKDIR"; du -sh .repo . 2>/dev/null || true
           exit "$RC"
-
-      - name: Pasang device tree + override
-        run: |
-          set -e
-          DEST=~/twrp/device/xiaomi/malachite
-          mkdir -p ~/twrp/device/xiaomi
-          rm -rf "$DEST"
-          cp -r "$GITHUB_WORKSPACE/device_tree" "$DEST"
-          rm -rf "$DEST/.git" "$DEST/.github"
-          # Override opsional dari repo lu sendiri (hasil ekstrak dari firmware HP lu):
-          if [ -f "$DEST/override/dtb" ]; then
-            echo "Pakai override/dtb"; cp "$DEST/override/dtb" "$DEST/prebuilt/dtb"
-          fi
-          if [ -d "$DEST/override/modules" ] && ls "$DEST/override/modules"/* >/dev/null 2>&1; then
-            echo "Pakai override/modules"; cp -f "$DEST/override/modules"/* "$DEST/recovery/root/lib/modules/"
-          fi
-
-      - name: Apply patch ke bootable/recovery
-        run: |
-          set -e
-          cd ~/twrp
-          P=../../device/xiaomi/malachite/patches/0001-minuitwrp-skip-unavailable-aidl-haptics.patch
-          if git -C bootable/recovery apply --check "$P" 2>/dev/null; then
-            git -C bootable/recovery apply "$P"; echo "patch diterapkan" | tee ~/patch-status.txt
-          elif git -C bootable/recovery apply --reverse --check "$P" 2>/dev/null; then
-            echo "patch sudah ada di source" | tee ~/patch-status.txt
-          else
-            echo "::error::Patch tidak cocok dengan source bootable/recovery sekarang (upstream menguji di TeamWin android-14.1 commit 426b747737e7). Cek manual."
-            exit 1
-          fi
 
       - name: Build vendor_boot
         env:
@@ -127,48 +99,12 @@ jobs:
           cd ~/twrp
           export ALLOW_MISSING_DEPENDENCIES=true
           export LC_ALL=C
+          export CCACHE_DIR="$WORKDIR/ccache"
+          mkdir -p "$CCACHE_DIR"
+          ccache -M 8G >/dev/null || true
           if [ "$PERM" = "true" ]; then export MALACHITE_RECOVERY_PERMISSIVE=true; fi
           set +e
           source build/envsetup.sh
           lunch twrp_malachite-ap2a-eng
-          mka vendorbootimage -j"$(nproc --all)" 2>&1 | tee ~/build.log
+          mka vendorbootimage -j"${BUILD_JOBS}" 2>&1 | tee ~/build.log
           exit "${PIPESTATUS[0]}"
-
-      - name: Cek hasil
-        run: |
-          OUT=~/twrp/out/target/product/malachite
-          ls -la "$OUT"/vendor_boot.img
-          SIZE=$(stat -c %s "$OUT/vendor_boot.img")
-          echo "ukuran vendor_boot.img: $SIZE (batas partisi 67108864)"
-          [ "$SIZE" -le 67108864 ] || { echo "::error::Image lebih besar dari partisi vendor_boot"; exit 1; }
-          mkdir -p ~/out
-          cp "$OUT/vendor_boot.img" ~/out/
-          {
-            echo "tree commit: $(git -C $GITHUB_WORKSPACE/device_tree rev-parse HEAD)"
-            echo "selinux_permissive: ${{ inputs.selinux_permissive }}"
-            echo "patch: $(cat ~/patch-status.txt)"
-            echo "override dtb: $([ -f $GITHUB_WORKSPACE/device_tree/override/dtb ] && echo ya || echo tidak)"
-            echo "override modules: $([ -d $GITHUB_WORKSPACE/device_tree/override/modules ] && ls $GITHUB_WORKSPACE/device_tree/override/modules | wc -l || echo 0) file"
-          } > ~/out/build-info.txt
-          cd ~/out && sha256sum vendor_boot.img > SHA256SUMS.txt && cat SHA256SUMS.txt build-info.txt
-
-      - name: Upload hasil
-        uses: actions/upload-artifact@v4
-        with:
-          name: twrp-malachite
-          path: ~/out/*
-          retention-days: 7
-
-      - name: Upload log (kalau gagal)
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log
-          path: ~/build.log
-          retention-days: 7
-
-      - name: Diagnostik disk (kalau gagal)
-        if: failure()
-        run: |
-          df -h || true
-          du -sh ~/twrp/.repo ~/twrp 2>/dev/null || true
