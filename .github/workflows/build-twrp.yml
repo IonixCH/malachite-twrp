@@ -4,7 +4,7 @@ name: Build TWRP (malachite)
 env:
   REPO_SYNC_JOBS: 1
   BUILD_JOBS: 1
-  MIN_FREE_MB: 16000
+  MIN_FREE_MB: 20000
   BUILD_DISK_CRIT_MB: 4000
 
 on:
