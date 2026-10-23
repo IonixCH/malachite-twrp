@@ -92,6 +92,16 @@ jobs:
           echo "--- hasil sync: rc=$RC"; df -h "$WORKDIR"; du -sh .repo . 2>/dev/null || true
           exit "$RC"
 
+      - name: Tempatkan device tree pada path yang benar untuk build TWRP
+        run: |
+          set -euxo pipefail
+          cd ~/twrp
+          mkdir -p device/xiaomi
+          rm -rf device/xiaomi/malachite
+          cp -a "$GITHUB_WORKSPACE/device_tree" device/xiaomi/malachite
+          ls -ld device/xiaomi/malachite
+          test -f device/xiaomi/malachite/twrp_malachite.mk
+
       - name: Build vendor_boot
         env:
           PERM: ${{ inputs.selinux_permissive }}
